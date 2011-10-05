@@ -2,7 +2,7 @@ import functools
 import logging
 
 from django.conf import settings
-from django.core.cache import cache
+from django.core.cache import cache, get_cache
 from django.db import models
 from django.db.models import signals
 from django.db.models.sql import query
@@ -10,6 +10,11 @@ from django.utils import encoding
 
 from .invalidation import invalidator, flush_key, make_key, byid
 
+def _cache(backend):
+    if backend:
+        return get_cache(backend)
+    else:
+        return cache
 
 class NullHandler(logging.Handler):
 
@@ -27,12 +32,16 @@ FETCH_BY_ID = getattr(settings, 'FETCH_BY_ID', False)
 
 
 class CachingManager(models.Manager):
+    
+    def __init__(self, backend=None):
+        self.backend = backend
+        super(CachingManager, self).__init__()
 
     # Tell Django to use this manager when resolving foreign keys.
     use_for_related_fields = True
 
     def get_query_set(self):
-        return CachingQuerySet(self.model)
+        return CachingQuerySet(self.model, backend=self.backend)
 
     def contribute_to_class(self, cls, name):
         signals.post_save.connect(self.post_save, sender=cls)
@@ -52,7 +61,8 @@ class CachingManager(models.Manager):
 
     def raw(self, raw_query, params=None, *args, **kwargs):
         return CachingRawQuerySet(raw_query, self.model, params=params,
-                                  using=self._db, *args, **kwargs)
+                                  using=self._db, backend=self.backend,
+                                  *args, **kwargs)
 
     def cache(self, timeout=None):
         return self.get_query_set().cache(timeout)
@@ -69,10 +79,11 @@ class CacheMachine(object):
     called to get an iterator over some database results.
     """
 
-    def __init__(self, query_string, iter_function, timeout=None):
+    def __init__(self, query_string, iter_function, timeout=None, backend=None):
         self.query_string = query_string
         self.iter_function = iter_function
         self.timeout = timeout
+        self.backend = backend
 
     def query_key(self):
         """Generate the cache key for this query."""
@@ -85,7 +96,7 @@ class CacheMachine(object):
             raise StopIteration
 
         # Try to fetch from the cache.
-        cached = cache.get(query_key)
+        cached = _cache(self.backend).get(query_key)
         if cached is not None:
             log.debug('cache hit: %s' % self.query_string)
             for obj in cached:
@@ -112,13 +123,16 @@ class CacheMachine(object):
         """Cache query_key => objects, then update the flush lists."""
         query_key = self.query_key()
         query_flush = flush_key(self.query_string)
-        cache.add(query_key, objects, timeout=self.timeout)
+        _cache(self.backend).add(query_key, objects, timeout=self.timeout)
         invalidator.cache_objects(objects, query_key, query_flush)
 
 
 class CachingQuerySet(models.query.QuerySet):
 
     def __init__(self, *args, **kw):
+        self.backend = kw.get('backend', None)
+        if kw.has_key('backend'):
+            del kw['backend']
         super(CachingQuerySet, self).__init__(*args, **kw)
         self.timeout = None
 
@@ -141,7 +155,8 @@ class CachingQuerySet(models.query.QuerySet):
                 return iterator()
             if FETCH_BY_ID:
                 iterator = self.fetch_by_id
-            return iter(CacheMachine(query_string, iterator, self.timeout))
+            return iter(CacheMachine(query_string, iterator, self.timeout,
+                                     backend=self.backend))
 
     def fetch_by_id(self):
         """
@@ -157,7 +172,7 @@ class CachingQuerySet(models.query.QuerySet):
         vals = self.values_list('pk', *self.query.extra.keys())
         pks = [val[0] for val in vals]
         keys = dict((byid(self.model._cache_key(pk)), pk) for pk in pks)
-        cached = dict((k, v) for k, v in cache.get_many(keys).items()
+        cached = dict((k, v) for k, v in self._get_many(keys).items()
                       if v is not None)
 
         # Pick up the objects we missed.
@@ -166,7 +181,7 @@ class CachingQuerySet(models.query.QuerySet):
             others = self.fetch_missed(missed)
             # Put the fetched objects back in cache.
             new = dict((byid(o), o) for o in others)
-            cache.set_many(new)
+            _cache(self.backend).set_many(new)
         else:
             new = {}
 
@@ -174,6 +189,9 @@ class CachingQuerySet(models.query.QuerySet):
         objects = dict((o.pk, o) for o in cached.values() + new.values())
         for pk in pks:
             yield objects[pk]
+            
+    def _get_many(self, keys):
+        return _cache(self.backend).get_many(keys)
 
     def fetch_missed(self, pks):
         # Reuse the queryset but get a clean query.
@@ -194,7 +212,8 @@ class CachingQuerySet(models.query.QuerySet):
         if timeout is None:
             return super_count()
         else:
-            return cached_with(self, super_count, query_string, timeout)
+            return cached_with(self, super_count, query_string, timeout, 
+                               self.backend)
 
     def cache(self, timeout=None):
         qs = self._clone()
@@ -207,6 +226,7 @@ class CachingQuerySet(models.query.QuerySet):
     def _clone(self, *args, **kw):
         qs = super(CachingQuerySet, self)._clone(*args, **kw)
         qs.timeout = self.timeout
+        qs.backend = self.backend
         return qs
 
 
@@ -243,10 +263,16 @@ class CachingMixin:
 
 class CachingRawQuerySet(models.query.RawQuerySet):
 
+    def __init__(self, *args, **kw):
+        self.backend = kw.get('backend', None)
+        if kw.has_key('backend'):
+            del kw['backend']
+        super(CachingRawQuerySet, self).__init__(*args, **kw)
+        
     def __iter__(self):
         iterator = super(CachingRawQuerySet, self).__iter__
         sql = self.raw_query % tuple(self.params)
-        for obj in CacheMachine(sql, iterator):
+        for obj in CacheMachine(sql, iterator, backend=self.backend):
             yield obj
         raise StopIteration
 
@@ -255,20 +281,20 @@ def _function_cache_key(key):
     return make_key('f:%s' % key, with_locale=True)
 
 
-def cached(function, key_, duration=None):
+def cached(function, key_, duration=None, backend=None):
     """Only calls the function if ``key`` is not already in the cache."""
     key = _function_cache_key(key_)
-    val = cache.get(key)
+    val = _cache(backend).get(key)
     if val is None:
         log.debug('cache miss for %s' % key)
         val = function()
-        cache.set(key, val, duration)
+        _cache(backend).set(key, val, duration)
     else:
         log.debug('cache hit for %s' % key)
     return val
 
 
-def cached_with(obj, f, f_key, timeout=None):
+def cached_with(obj, f, f_key, timeout=None, backend=None):
     """Helper for caching a function call within an object's flush list."""
     try:
         obj_key = (obj.query_key() if hasattr(obj, 'query_key')
@@ -281,7 +307,7 @@ def cached_with(obj, f, f_key, timeout=None):
     # Put the key generated in cached() into this object's flush list.
     invalidator.add_to_flush_list(
         {obj.flush_key(): [_function_cache_key(key)]})
-    return cached(f, key, timeout)
+    return cached(f, key, timeout, backend=backend)
 
 
 class cached_method(object):

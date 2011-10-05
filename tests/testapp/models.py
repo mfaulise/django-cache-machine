@@ -9,6 +9,9 @@ from caching.base import CachingMixin, CachingManager, cached_method
 call_counter = mock.Mock()
 
 
+call_secondary_counter = mock.Mock()
+
+
 class User(CachingMixin, models.Model):
     name = models.CharField(max_length=30)
 
@@ -27,3 +30,14 @@ class Addon(CachingMixin, models.Model):
         """This is a docstring for calls()"""
         call_counter()
         return arg, call_counter.call_count
+
+
+class Secondary(CachingMixin, models.Model):
+    val = models.IntegerField()
+
+    objects = CachingManager('secondary')
+    
+    @cached_method
+    def calls(self, arg=1):
+        call_secondary_counter()
+        return arg, call_secondary_counter.call_count

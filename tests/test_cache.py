@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from django.conf import settings
-from django.core.cache import cache
+from django.core.cache import cache, get_cache
 from django.utils import translation, encoding
 
 import jinja2
@@ -11,7 +11,7 @@ from test_utils import ExtraAppTestCase
 import caching.base as caching
 from caching import invalidation
 
-from testapp.models import Addon, User
+from testapp.models import Addon, User, Secondary
 
 
 class CachingTestCase(ExtraAppTestCase):
@@ -20,6 +20,7 @@ class CachingTestCase(ExtraAppTestCase):
 
     def setUp(self):
         cache.clear()
+        get_cache('secondary').clear()
         self.old_timeout = getattr(settings, 'CACHE_COUNT_TIMEOUT', None)
         if getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
             invalidation.redis.flushall()
@@ -421,3 +422,61 @@ class CachingTestCase(ExtraAppTestCase):
         if not getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
             cache_mock.return_value.values.return_value = [None, [1]]
             eq_(caching.invalidator.get_flush_lists(None), set([1]))
+            
+    def test_secondary_cache(self):
+        assert Secondary.objects.get(id=1).from_cache is False
+        assert Secondary.objects.get(id=1).from_cache is True
+
+    def test_secondary_filter_cache(self):
+        assert Secondary.objects.filter(id=1)[0].from_cache is False
+        assert Secondary.objects.filter(id=1)[0].from_cache is True
+
+    def test_secondary_invalidation(self):
+        assert Secondary.objects.get(id=1).from_cache is False
+        s = [x for x in Secondary.objects.all() if x.id == 1][0]
+        assert s.from_cache is False
+
+        assert Secondary.objects.get(id=1).from_cache is True
+        s = [x for x in Secondary.objects.all() if x.id == 1][0]
+        assert s.from_cache is True
+
+        s.save()
+        assert Secondary.objects.get(id=1).from_cache is False
+        s = [x for x in Secondary.objects.all() if x.id == 1][0]
+        assert s.from_cache is False
+
+    def test_secondary_raw_cache(self):
+        sql = 'SELECT * FROM %s WHERE id = 1' % Secondary._meta.db_table
+        raw = list(Secondary.objects.raw(sql))
+        eq_(len(raw), 1)
+        raw_secondary = raw[0]
+        a = Secondary.objects.get(id=1)
+        for field in Secondary._meta.fields:
+            eq_(getattr(a, field.name), getattr(raw_secondary, field.name))
+        assert raw_secondary.from_cache is False
+
+        cached = list(Secondary.objects.raw(sql))
+        eq_(len(cached), 1)
+        cached_secondary = cached[0]
+        a = Secondary.objects.get(id=1)
+        for field in Secondary._meta.fields:
+            eq_(getattr(a, field.name), getattr(cached_secondary, field.name))
+        assert cached_secondary.from_cache is True
+        
+    def test_secondary_cached_method(self):
+        a = Secondary.objects.get(id=1)
+        eq_(a.calls(), (1, 1))
+        eq_(a.calls(), (1, 1))
+
+        a.save()
+        # Still returns 1 since the object has it's own local cache.
+        eq_(a.calls(), (1, 1))
+        eq_(a.calls(3), (3, 2))
+
+        a = Secondary.objects.get(id=1)
+        eq_(a.calls(), (1, 3))
+        eq_(a.calls(4), (4, 4))
+        eq_(a.calls(3), (3, 2))
+
+        b = Secondary.objects.create(id=5, val=32)
+        eq_(b.calls(), (1, 5))
