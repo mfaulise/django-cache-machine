@@ -8,7 +8,8 @@ from django.db.models import signals
 from django.db.models.sql import query
 from django.utils import encoding
 
-from .invalidation import invalidator, flush_key, make_key, byid
+from .invalidation import flush_key, make_key, byid
+from caching.invalidation import Invalidator, NullInvalidator
 
 def _cache(backend):
     if backend:
@@ -33,15 +34,20 @@ FETCH_BY_ID = getattr(settings, 'FETCH_BY_ID', False)
 
 class CachingManager(models.Manager):
     
-    def __init__(self, backend=None):
+    def __init__(self, backend=None, invalidator_class=Invalidator):
         self.backend = backend
+        self.invalidator = invalidator_class()
         super(CachingManager, self).__init__()
 
     # Tell Django to use this manager when resolving foreign keys.
     use_for_related_fields = True
 
+    def get_cahce(self):
+        return _cache(self.backend)
+
     def get_query_set(self):
-        return CachingQuerySet(self.model, backend=self.backend)
+        return CachingQuerySet(self.model, backend=self.backend,
+                               invalidator=self.invalidator)
 
     def contribute_to_class(self, cls, name):
         signals.post_save.connect(self.post_save, sender=cls)
@@ -57,12 +63,12 @@ class CachingManager(models.Manager):
     def invalidate(self, *objects):
         """Invalidate all the flush lists associated with ``objects``."""
         keys = [k for o in objects for k in o._cache_keys()]
-        invalidator.invalidate_keys(keys)
+        self.invalidator.invalidate_keys(keys, _cache(self.backend))
 
     def raw(self, raw_query, params=None, *args, **kwargs):
         return CachingRawQuerySet(raw_query, self.model, params=params,
                                   using=self._db, backend=self.backend,
-                                  *args, **kwargs)
+                                  invalidator=self.invalidator, *args, **kwargs)
 
     def cache(self, timeout=None):
         return self.get_query_set().cache(timeout)
@@ -79,11 +85,13 @@ class CacheMachine(object):
     called to get an iterator over some database results.
     """
 
-    def __init__(self, query_string, iter_function, timeout=None, backend=None):
+    def __init__(self, query_string, iter_function, backend, invalidator,
+                 timeout=None):
         self.query_string = query_string
         self.iter_function = iter_function
         self.timeout = timeout
         self.backend = backend
+        self.invalidator = invalidator
 
     def query_key(self):
         """Generate the cache key for this query."""
@@ -124,15 +132,19 @@ class CacheMachine(object):
         query_key = self.query_key()
         query_flush = flush_key(self.query_string)
         _cache(self.backend).add(query_key, objects, timeout=self.timeout)
-        invalidator.cache_objects(objects, query_key, query_flush)
+        self.invalidator.cache_objects(objects, query_key, query_flush,
+                                       _cache(self.backend))
 
 
 class CachingQuerySet(models.query.QuerySet):
 
     def __init__(self, *args, **kw):
         self.backend = kw.get('backend', None)
+        self.invalidator = kw.get('invalidator', NullInvalidator())
         if kw.has_key('backend'):
             del kw['backend']
+        if kw.has_key('invalidator'):
+            del kw['invalidator']
         super(CachingQuerySet, self).__init__(*args, **kw)
         self.timeout = None
 
@@ -155,8 +167,8 @@ class CachingQuerySet(models.query.QuerySet):
                 return iterator()
             if FETCH_BY_ID:
                 iterator = self.fetch_by_id
-            return iter(CacheMachine(query_string, iterator, self.timeout,
-                                     backend=self.backend))
+            return iter(CacheMachine(query_string, iterator, self.backend,
+                                     self.invalidator, self.timeout))
 
     def fetch_by_id(self):
         """
@@ -213,7 +225,7 @@ class CachingQuerySet(models.query.QuerySet):
             return super_count()
         else:
             return cached_with(self, super_count, query_string, timeout, 
-                               self.backend)
+                               self.backend, self.invalidator)
 
     def cache(self, timeout=None):
         qs = self._clone()
@@ -227,6 +239,7 @@ class CachingQuerySet(models.query.QuerySet):
         qs = super(CachingQuerySet, self)._clone(*args, **kw)
         qs.timeout = self.timeout
         qs.backend = self.backend
+        qs.invalidator = self.invalidator
         return qs
 
 
@@ -265,14 +278,17 @@ class CachingRawQuerySet(models.query.RawQuerySet):
 
     def __init__(self, *args, **kw):
         self.backend = kw.get('backend', None)
+        self.invalidator = kw.get('invalidator', NullInvalidator())
         if kw.has_key('backend'):
             del kw['backend']
+        if kw.has_key('invalidator'):
+            del kw['invalidator']
         super(CachingRawQuerySet, self).__init__(*args, **kw)
         
     def __iter__(self):
         iterator = super(CachingRawQuerySet, self).__iter__
         sql = self.raw_query % tuple(self.params)
-        for obj in CacheMachine(sql, iterator, backend=self.backend):
+        for obj in CacheMachine(sql, iterator, self.backend, self.invalidator):
             yield obj
         raise StopIteration
 
@@ -294,7 +310,8 @@ def cached(function, key_, duration=None, backend=None):
     return val
 
 
-def cached_with(obj, f, f_key, timeout=None, backend=None):
+def cached_with(obj, f, f_key, timeout=None, backend=None, 
+                invalidator=NullInvalidator()):
     """Helper for caching a function call within an object's flush list."""
     try:
         obj_key = (obj.query_key() if hasattr(obj, 'query_key')
@@ -306,7 +323,7 @@ def cached_with(obj, f, f_key, timeout=None, backend=None):
     key = '%s:%s' % tuple(map(encoding.smart_str, (f_key, obj_key)))
     # Put the key generated in cached() into this object's flush list.
     invalidator.add_to_flush_list(
-        {obj.flush_key(): [_function_cache_key(key)]})
+        {obj.flush_key(): [_function_cache_key(key)]}, _cache(backend))
     return cached(f, key, timeout, backend=backend)
 
 
@@ -319,8 +336,9 @@ class cached_method(object):
 
     Lifted from werkzeug.
     """
-    def __init__(self, func):
+    def __init__(self, func, manager=None):
         self.func = func
+        self.manager = manager
         functools.update_wrapper(self, func)
 
     def __get__(self, obj, type=None):
@@ -329,7 +347,7 @@ class cached_method(object):
         _missing = object()
         value = obj.__dict__.get(self.__name__, _missing)
         if value is _missing:
-            w = MethodWrapper(obj, self.func)
+            w = MethodWrapper(obj, self.func, self.manager)
             obj.__dict__[self.__name__] = w
             return w
         return value
@@ -342,9 +360,10 @@ class MethodWrapper(object):
     The first call for a set of (args, kwargs) will use an external cache.
     After that, an object-local dict cache will be used.
     """
-    def __init__(self, obj, func):
+    def __init__(self, obj, func, manager):
         self.obj = obj
         self.func = func
+        self.manager = manager
         functools.update_wrapper(self, func)
         self.cache = {}
 
@@ -356,5 +375,8 @@ class MethodWrapper(object):
                                  arg_keys, kwarg_keys)
         if key not in self.cache:
             f = functools.partial(self.func, self.obj, *args, **kwargs)
-            self.cache[key] = cached_with(self.obj, f, key)
+            self.cache[key] = cached_with(self.obj, f, key,
+                                          backend=self.manager.backend,
+                                          invalidator=self.manager.invalidator)
         return self.cache[key]
+

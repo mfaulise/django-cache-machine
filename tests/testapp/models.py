@@ -25,11 +25,11 @@ class Addon(CachingMixin, models.Model):
 
     objects = CachingManager()
 
-    @cached_method
     def calls(self, arg=1):
         """This is a docstring for calls()"""
         call_counter()
         return arg, call_counter.call_count
+    calls = cached_method(calls, objects)
 
 
 class Secondary(CachingMixin, models.Model):
@@ -37,7 +37,7 @@ class Secondary(CachingMixin, models.Model):
 
     objects = CachingManager('secondary')
     
-    @cached_method
     def calls(self, arg=1):
         call_secondary_counter()
         return arg, call_secondary_counter.call_count
+    calls = cached_method(calls, objects)

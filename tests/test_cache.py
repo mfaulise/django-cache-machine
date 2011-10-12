@@ -149,6 +149,7 @@ class CachingTestCase(ExtraAppTestCase):
         settings.CACHE_COUNT_TIMEOUT = 60
         cache_mock.scheme = 'memcached'
         cache_mock.get.return_value = None
+        cache_mock.get_many.return_value = {}
 
         q = Addon.objects.all()
         count = q.count()
@@ -168,7 +169,8 @@ class CachingTestCase(ExtraAppTestCase):
         """Check that we're making a flush list for the queryset."""
         q = Addon.objects.all()
         objects = list(q)  # Evaluate the queryset so it gets cached.
-        caching.invalidator.add_to_flush_list({q.flush_key(): ['remove-me']})
+        Addon.objects.invalidator.add_to_flush_list({q.flush_key(): ['remove-me']},
+                                                    Addon.objects.get_cahce())
         cache.set('remove-me', 15)
 
         Addon.objects.invalidate(objects[0])
@@ -264,7 +266,8 @@ class CachingTestCase(ExtraAppTestCase):
             return counter.call_count
 
         a = Addon.objects.get(id=1)
-        f = lambda: caching.cached_with(a, expensive, 'key')
+        f = lambda: caching.cached_with(a, expensive, 'key',
+                                        invalidator=Addon.objects.invalidator)
 
         # Only gets called once.
         eq_(f(), 1)
@@ -284,7 +287,8 @@ class CachingTestCase(ExtraAppTestCase):
 
         counter.reset_mock()
         q = Addon.objects.filter(id=1)
-        f = lambda: caching.cached_with(q, expensive, 'key')
+        f = lambda: caching.cached_with(q, expensive, 'key',
+                                        invalidator=Addon.objects.invalidator)
 
         # Only gets called once.
         eq_(f(), 1)
@@ -417,12 +421,6 @@ class CachingTestCase(ExtraAppTestCase):
         caching.make_key(f, with_locale=True)
         translation.deactivate()
 
-    @mock.patch('caching.invalidation.cache.get_many')
-    def test_get_flush_lists_none(self, cache_mock):
-        if not getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
-            cache_mock.return_value.values.return_value = [None, [1]]
-            eq_(caching.invalidator.get_flush_lists(None), set([1]))
-            
     def test_secondary_cache(self):
         assert Secondary.objects.get(id=1).from_cache is False
         assert Secondary.objects.get(id=1).from_cache is True

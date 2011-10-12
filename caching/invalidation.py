@@ -5,7 +5,7 @@ import logging
 import socket
 
 from django.conf import settings
-from django.core.cache import cache, parse_backend_uri
+from django.core.cache import parse_backend_uri
 from django.utils import encoding, translation
 
 try:
@@ -67,18 +67,18 @@ def safe_redis(return_type):
 
 class Invalidator(object):
 
-    def invalidate_keys(self, keys):
+    def invalidate_keys(self, keys, cache):
         """Invalidate all the flush lists named by the list of ``keys``."""
         if not keys:
             return
-        flush, flush_keys = self.find_flush_lists(keys)
+        flush, flush_keys = self.find_flush_lists(keys, cache)
 
         if flush:
             cache.set_many(dict((k, None) for k in flush), 5)
         if flush_keys:
-            self.clear_flush_lists(flush_keys)
+            self.clear_flush_lists(flush_keys, cache)
 
-    def cache_objects(self, objects, query_key, query_flush):
+    def cache_objects(self, objects, query_key, query_flush, cache):
         # Add this query to the flush list of each object.  We include
         # query_flush so that other things can be cached against the queryset
         # and still participate in invalidation.
@@ -97,9 +97,9 @@ class Invalidator(object):
                     flush_lists[key].add(obj_flush)
                 if FETCH_BY_ID:
                     flush_lists[key].add(byid(obj))
-        self.add_to_flush_list(flush_lists)
+        self.add_to_flush_list(flush_lists, cache)
 
-    def find_flush_lists(self, keys):
+    def find_flush_lists(self, keys, cache):
         """
         Recursively search for flush lists and objects to invalidate.
 
@@ -112,7 +112,7 @@ class Invalidator(object):
         # Add other flush keys from the lists, which happens when a parent
         # object includes a foreign key.
         while 1:
-            to_flush = self.get_flush_lists(new_keys)
+            to_flush = self.get_flush_lists(new_keys, cache)
             flush.update(to_flush)
             new_keys = set(k for k in to_flush if k.startswith(FLUSH))
             diff = new_keys.difference(keys)
@@ -121,7 +121,7 @@ class Invalidator(object):
             else:
                 return flush, keys
 
-    def add_to_flush_list(self, mapping):
+    def add_to_flush_list(self, mapping, cache):
         """Update flush lists with the {flush_key: [query_key,...]} map."""
         flush_lists = collections.defaultdict(set)
         flush_lists.update(cache.get_many(mapping.keys()))
@@ -132,13 +132,13 @@ class Invalidator(object):
                 flush_lists[key].update(list_)
         cache.set_many(flush_lists)
 
-    def get_flush_lists(self, keys):
+    def get_flush_lists(self, keys, cache):
         """Return a set of object keys from the lists in `keys`."""
         return set(e for flush_list in
                    filter(None, cache.get_many(keys).values())
                    for e in flush_list)
 
-    def clear_flush_lists(self, keys):
+    def clear_flush_lists(self, keys, cache):
         """Remove the given keys from the database."""
         cache.delete_many(keys)
 
@@ -152,7 +152,7 @@ class RedisInvalidator(Invalidator):
         return key
 
     @safe_redis(None)
-    def add_to_flush_list(self, mapping):
+    def add_to_flush_list(self, mapping, cache=None):
         """Update flush lists with the {flush_key: [query_key,...]} map."""
         pipe = redis.pipeline(transaction=False)
         for key, list_ in mapping.items():
@@ -165,13 +165,13 @@ class RedisInvalidator(Invalidator):
         return redis.sunion(map(self.safe_key, keys))
 
     @safe_redis(None)
-    def clear_flush_lists(self, keys):
+    def clear_flush_lists(self, keys, cache):
         redis.delete(*map(self.safe_key, keys))
 
 
 class NullInvalidator(Invalidator):
 
-    def add_to_flush_list(self, mapping):
+    def add_to_flush_list(self, mapping, cache):
         return
 
 
@@ -201,11 +201,5 @@ def get_redis_backend():
     return redislib.Redis(host=host, port=port, db=db, password=password,
                           socket_timeout=socket_timeout)
 
-
-if getattr(settings, 'CACHE_MACHINE_NO_INVALIDATION', False):
-    invalidator = NullInvalidator()
-elif getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
+if getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
     redis = get_redis_backend()
-    invalidator = RedisInvalidator()
-else:
-    invalidator = Invalidator()
