@@ -201,5 +201,12 @@ def get_redis_backend():
     return redislib.Redis(host=host, port=port, db=db, password=password,
                           socket_timeout=socket_timeout)
 
-if getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
+
+if getattr(settings, 'CACHE_MACHINE_NO_INVALIDATION', False):
+    invalidator = NullInvalidator()
+elif getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
     redis = get_redis_backend()
+    invalidator = RedisInvalidator()
+else:
+    invalidator = Invalidator()
+

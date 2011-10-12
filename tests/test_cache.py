@@ -169,8 +169,8 @@ class CachingTestCase(ExtraAppTestCase):
         """Check that we're making a flush list for the queryset."""
         q = Addon.objects.all()
         objects = list(q)  # Evaluate the queryset so it gets cached.
-        Addon.objects.invalidator.add_to_flush_list({q.flush_key(): ['remove-me']},
-                                                    Addon.objects.get_cahce())
+        caching.invalidator.add_to_flush_list({q.flush_key(): ['remove-me']},
+                                              Addon.objects.get_cache())
         cache.set('remove-me', 15)
 
         Addon.objects.invalidate(objects[0])
@@ -266,8 +266,7 @@ class CachingTestCase(ExtraAppTestCase):
             return counter.call_count
 
         a = Addon.objects.get(id=1)
-        f = lambda: caching.cached_with(a, expensive, 'key',
-                                        invalidator=Addon.objects.invalidator)
+        f = lambda: caching.cached_with(a, expensive, 'key')
 
         # Only gets called once.
         eq_(f(), 1)
@@ -287,8 +286,7 @@ class CachingTestCase(ExtraAppTestCase):
 
         counter.reset_mock()
         q = Addon.objects.filter(id=1)
-        f = lambda: caching.cached_with(q, expensive, 'key',
-                                        invalidator=Addon.objects.invalidator)
+        f = lambda: caching.cached_with(q, expensive, 'key')
 
         # Only gets called once.
         eq_(f(), 1)
